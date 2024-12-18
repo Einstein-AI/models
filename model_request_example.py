@@ -5,8 +5,11 @@ from datetime import timezone
 import bson
 import anthropic
 from db_connection import db
+from huggingface_hub import InferenceClient
+import os
 
 import logging
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +46,9 @@ class NamedConstants:
     CHAT_HISTORY_COLLECTION = "chat_history"
     USERS_BALANCE_COLLECTION = "users_balance"
     claude_api_key = "your_api_key"
+    LLAMA_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
+    huggingface_api_key = os.getenv('HUGGINGFACE_API_KEY')
+    DEFAULT_THUMBNAIL_URL = "https://chat-media-einstein.s3.amazonaws.com/thumbnails/thumbnail_4.png"
 
 
 def create_chat_history(request, response_data, created_at):
@@ -64,6 +70,7 @@ def create_chat_history(request, response_data, created_at):
         workspace_id=request.workspace_id,
         group_id=request.group_id,
         createdAt=datetime.now(timezone.utc),
+        thumbnail_url=NamedConstants.DEFAULT_THUMBNAIL_URL
     )
 
 
@@ -97,9 +104,19 @@ anthropic_client = anthropic.Anthropic(
 )
 
 
+hf_client = InferenceClient(token=NamedConstants.huggingface_api_key)
+
+
 def calculate_text_cost(model_name, prompt_tokens, completion_tokens):
     if model_name == NamedConstants.CLAUDE_MODEL:
         return 100
+    elif model_name == NamedConstants.LLAMA_MODEL:
+        PRICE_PER_1K_INPUT_TOKENS = 0.01
+        PRICE_PER_1K_OUTPUT_TOKENS = 0.03
+        
+        prompt_cost = (prompt_tokens / 1000) * PRICE_PER_1K_INPUT_TOKENS
+        completion_cost = (completion_tokens / 1000) * PRICE_PER_1K_OUTPUT_TOKENS
+        return prompt_cost + completion_cost
     return 0
 
 
@@ -122,6 +139,41 @@ async def execute_claude_call(messages, model_name):
         cost += temp_cost
         response_data += " " + temp_response
     return cost, response_data
+
+
+async def execute_huggingface_call(messages, model_name):
+    try:
+        prompt = "".join([
+            "<s>[INST] " + m["content"] + " [/INST]" if m["role"] == "user" 
+            else m["content"] + "</s>" 
+            for m in messages
+        ])
+        
+        response = await asyncio.to_thread(
+            hf_client.text_generation,
+            prompt,
+            model=model_name,
+            max_new_tokens=256,
+            temperature=0.7,
+            do_sample=True,
+            top_p=0.95,
+            top_k=50,
+            repetition_penalty=1.1,
+            stop_sequences=["</s>", "[INST]"]
+        )
+        
+        if not response or not isinstance(response, str):
+            raise Exception("Invalid response from Hugging Face API")
+            
+        prompt_tokens = len(prompt.split())
+        completion_tokens = len(response.split())
+        cost = calculate_text_cost(model_name, prompt_tokens, completion_tokens)
+        
+        return cost, response
+    except asyncio.TimeoutError:
+        raise Exception("Hugging Face API request timed out")
+    except Exception as e:
+        raise Exception(f"Hugging Face API error: {str(e)}")
 
 
 async def check_user_balance(user_id):
@@ -183,6 +235,75 @@ async def claude_service(request: TextGenerate):
                 "balance": balance,
                 "user_id": request.userID,
             }
+        return {"status_code": 200, "content": content}
+    except Exception as e:
+        return {"status_code": 500, "content": {"message": str(e)}}
+
+
+async def llama_service(request: TextGenerate):
+    try:
+        response = await check_user_balance(request.userID)
+        if response:
+            return response
+            
+        model_name = NamedConstants.LLAMA_MODEL
+        prompt = request.prompt
+        
+        if request.id == "":
+            messages = [
+                {"role": "user", "content": prompt},
+            ]
+            try:
+                cost, response_data = await execute_huggingface_call(messages, model_name)
+            except Exception as e:
+                return {
+                    "status_code": 403,
+                    "content": {"message": f"Error accessing model: {str(e)}. You may need to request access at https://huggingface.co/meta-llama/Llama-2-70b-chat"}
+                }
+
+            created_at = datetime.now()
+            new_chat = create_chat_history(request, response_data, created_at)
+            saved_chat = await db.ChatHistory.insert_one(dict(new_chat))
+            object_id_string = str(saved_chat.inserted_id)
+
+            balance = await update_user_price(request.userID, cost)
+            content = {
+                "data": response_data,
+                "id": object_id_string,
+                "date": created_at.strftime("%I:%M %p"),
+                "thumbnail_url": new_chat.thumbnail_url,
+                "balance": balance,
+                "user_id": request.userID,
+            }
+        else:
+            users_chat_history_collection = db[NamedConstants.USERS_CHAT_HISTORY_COLLECTION]
+            messages = await users_chat_history_collection.find_one(
+                {"_id": bson.ObjectId(request.id)}, {"history": 1}
+            )
+            if not messages:
+                return {"status_code": 404, "content": {"message": "Chat not found"}}
+            
+            messages = [
+                message
+                for conversation in messages["history"]
+                for message in conversation
+            ]
+            
+            if request.reply and request.reply.strip():
+                prompt = request.reply + " " + prompt
+            messages.append({"role": "user", "content": prompt})
+            
+            cost, response_data = await execute_huggingface_call(messages, model_name)
+            await push_chat_history(request, response_data)
+            balance = await update_user_price(request.userID, cost)
+            content = {
+                "data": response_data,
+                "id": request.id,
+                "reply": request.reply,
+                "balance": balance,
+                "user_id": request.userID,
+            }
+            
         return {"status_code": 200, "content": content}
     except Exception as e:
         return {"status_code": 500, "content": {"message": str(e)}}
