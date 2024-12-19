@@ -272,71 +272,17 @@ async def claude_service(request: TextGenerate):
 
 async def llama_service(request: TextGenerate):
     try:
-        response = await check_user_balance(request.userID)
-        if response:
-            return response
-            
-        model_name = NamedConstants.LLAMA_MODEL
-        prompt = request.prompt
-        
-        if request.id == "":
-            messages = [
-                {"role": "user", "content": prompt},
-            ]
-            try:
-                cost, response_data = await execute_huggingface_call(messages, model_name)
-            except Exception as e:
-                return {
-                    "status_code": 403,
-                    "content": {"message": f"Error accessing model: {str(e)}. You may need to request access at https://huggingface.co/meta-llama/Llama-2-70b-chat"}
-                }
-
-            created_at = datetime.now()
-            new_chat = create_chat_history(request, response_data, created_at)
-            saved_chat = await db.ChatHistory.insert_one(dict(new_chat))
-            object_id_string = str(saved_chat.inserted_id)
-
-            balance = await update_user_price(request.userID, cost)
-            content = {
+        model_name = "gpt-4o"
+        cost, response_data = await execute_huggingface_call(request.messages, model_name)
+        return {
+            "status_code": 200,
+            "content": {
                 "data": response_data,
-                "id": object_id_string,
-                "date": created_at.strftime("%I:%M %p"),
-                "thumbnail_url": new_chat.thumbnail_url,
-                "balance": balance,
-                "user_id": request.userID,
-            }
-        else:
-            users_chat_history_collection = db[NamedConstants.USERS_CHAT_HISTORY_COLLECTION]
-            messages = await users_chat_history_collection.find_one(
-                {"_id": bson.ObjectId(request.id)}, {"history": 1}
-            )
-            if not messages:
-                return {"status_code": 404, "content": {"message": "Chat not found"}}
-            
-            messages = [
-                message
-                for conversation in messages["history"]
-                for message in conversation
-            ]
-            
-            if request.reply and request.reply.strip():
-                prompt = request.reply + " " + prompt
-            messages.append({"role": "user", "content": prompt})
-            
-            cost, response_data = await execute_huggingface_call(messages, model_name)
-            await push_chat_history(request, response_data)
-            balance = await update_user_price(request.userID, cost)
-            content = {
-                "data": response_data,
-                "id": request.id,
-                "reply": request.reply,
-                "balance": balance,
-                "user_id": request.userID,
-            }
-            
-        return {"status_code": 200, "content": content}
+                "cost": cost,
+            },
+        }
     except Exception as e:
-        return {"status_code": 500, "content": {"message": str(e)}}
+        return {"status_code": 500, "content": {"message": str(e)}}  
 
 
 # TODO: Implement new_model_service
