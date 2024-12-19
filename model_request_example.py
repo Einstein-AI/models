@@ -48,7 +48,10 @@ class NamedConstants:
     claude_api_key = "your_api_key"
     LLAMA_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
     huggingface_api_key = os.getenv('HUGGINGFACE_API_KEY')
-    DEFAULT_THUMBNAIL_URL = "https://chat-media-einstein.s3.amazonaws.com/thumbnails/thumbnail_4.png"
+    LLAMA_THUMBNAIL_URL = "https://chat-media-einstein.s3.amazonaws.com/image/6d8caa7c-552d-4e36-8cb3-eee8fa928313.png"
+    MAX_RETRIES = 3
+    INITIAL_RETRY_DELAY = 1
+    MAX_RETRY_DELAY = 10
 
 
 def create_chat_history(request, response_data, created_at):
@@ -70,7 +73,7 @@ def create_chat_history(request, response_data, created_at):
         workspace_id=request.workspace_id,
         group_id=request.group_id,
         createdAt=datetime.now(timezone.utc),
-        thumbnail_url=NamedConstants.DEFAULT_THUMBNAIL_URL
+        thumbnail_url=NamedConstants.LLAMA_THUMBNAIL_URL
     )
 
 
@@ -142,38 +145,65 @@ async def execute_claude_call(messages, model_name):
 
 
 async def execute_huggingface_call(messages, model_name):
-    try:
-        prompt = "".join([
-            "<s>[INST] " + m["content"] + " [/INST]" if m["role"] == "user" 
-            else m["content"] + "</s>" 
-            for m in messages
-        ])
-        
-        response = await asyncio.to_thread(
-            hf_client.text_generation,
-            prompt,
-            model=model_name,
-            max_new_tokens=256,
-            temperature=0.7,
-            do_sample=True,
-            top_p=0.95,
-            top_k=50,
-            repetition_penalty=1.1,
-            stop_sequences=["</s>", "[INST]"]
-        )
-        
-        if not response or not isinstance(response, str):
-            raise Exception("Invalid response from Hugging Face API")
+    retries = 0
+    while retries <= NamedConstants.MAX_RETRIES:
+        try:
+            prompt = "".join([
+                "<s>[INST] " + m["content"] + " [/INST]" if m["role"] == "user" 
+                else m["content"] + "</s>" 
+                for m in messages
+            ])
             
-        prompt_tokens = len(prompt.split())
-        completion_tokens = len(response.split())
-        cost = calculate_text_cost(model_name, prompt_tokens, completion_tokens)
-        
-        return cost, response
-    except asyncio.TimeoutError:
-        raise Exception("Hugging Face API request timed out")
-    except Exception as e:
-        raise Exception(f"Hugging Face API error: {str(e)}")
+            response = await asyncio.to_thread(
+                hf_client.text_generation,
+                prompt,
+                model=model_name,
+                max_new_tokens=256,
+                temperature=0.7,
+                do_sample=True,
+                top_p=0.95,
+                top_k=50,
+                repetition_penalty=1.1,
+                stop_sequences=["</s>", "[INST]"]
+            )
+            
+            if not response or not isinstance(response, str):
+                raise Exception("Invalid response from Hugging Face API")
+                
+            prompt_tokens = len(prompt.split())
+            completion_tokens = len(response.split())
+            cost = calculate_text_cost(model_name, prompt_tokens, completion_tokens)
+            
+            return cost, response
+
+        except asyncio.TimeoutError as e:
+            if retries == NamedConstants.MAX_RETRIES:
+                logger.error(f"Max retries reached after timeout: {str(e)}")
+                raise Exception("Hugging Face API request timed out after max retries")
+            
+            retry_delay = min(
+                NamedConstants.INITIAL_RETRY_DELAY * (2 ** retries),
+                NamedConstants.MAX_RETRY_DELAY
+            )
+            logger.warning(f"Timeout error, retrying in {retry_delay} seconds. Attempt {retries + 1}/{NamedConstants.MAX_RETRIES}")
+            await asyncio.sleep(retry_delay)
+            
+        except Exception as e:
+            if retries == NamedConstants.MAX_RETRIES:
+                logger.error(f"Max retries reached: {str(e)}")
+                raise Exception(f"Hugging Face API error after max retries: {str(e)}")
+            
+            if isinstance(e, (ConnectionError, TimeoutError)) or "rate limit" in str(e).lower():
+                retry_delay = min(
+                    NamedConstants.INITIAL_RETRY_DELAY * (2 ** retries),
+                    NamedConstants.MAX_RETRY_DELAY
+                )
+                logger.warning(f"API error, retrying in {retry_delay} seconds. Attempt {retries + 1}/{NamedConstants.MAX_RETRIES}")
+                await asyncio.sleep(retry_delay)
+            else:
+                raise
+                
+        retries += 1
 
 
 async def check_user_balance(user_id):
